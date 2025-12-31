@@ -1,0 +1,173 @@
+name: Update China IP list and generate GeoIP2 database
+
+permissions:
+  contents: write
+
+on:
+  push:
+    branches: [ master ]
+  
+  workflow_dispatch:
+
+  schedule: 
+    - cron:  '0 2 */3 * *'
+
+concurrency:
+  group: periodical-update
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Generate GeoIP2 database
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    defaults:
+      run:
+        shell: bash
+    steps:
+
+    - name: Set up Go
+      uses: actions/setup-go@v5
+      with:
+        go-version-file: go.mod
+        cache: true
+
+    - name: Check out code into the Go module directory
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+        persist-credentials: true
+
+    - name: Download dependencies
+      run: |
+        set -euo pipefail
+        go mod download
+    - name: Create dist folder
+      run: |
+        set -euo pipefail
+        mkdir -p dist
+
+    - name: Compile GeoIP conversion bin (Golang)
+      run: |
+        set -euo pipefail
+        chmod +x ./build.sh
+        ./build.sh
+
+    - name: Obtain CN IP lists
+      run: |
+        set -euo pipefail
+        curl -fSL --retry 3 --retry-delay 5 --connect-timeout 20 --max-time 120 -o dist/ipip_net.txt "https://raw.githubusercontent.com/17mon/china_ip_list/master/china_ip_list.txt"
+        curl -fSL --retry 3 --retry-delay 5 --connect-timeout 20 --max-time 120 -o dist/chunzhen.txt "https://raw.githubusercontent.com/metowolf/iplist/master/data/country/CN.txt"
+        echo >> dist/chunzhen.txt # ensure newline at ending
+
+        # Basic integrity checks: avoid HTML/error pages and ensure there are enough CIDR lines.
+        for f in dist/ipip_net.txt dist/chunzhen.txt; do
+          if grep -qiE '<!doctype html|<html' "$f"; then
+            echo "Downloaded file looks like HTML: $f" >&2
+            head -n 20 "$f" >&2 || true
+            exit 1
+          fi
+
+          cidr_lines=$(grep -cE '^[0-9]{1,3}(\.[0-9]{1,3}){3}/[0-9]{1,2}$' "$f" || true)
+          if [[ "$cidr_lines" -lt 1000 ]]; then
+            echo "Too few CIDR-looking lines in $f: $cidr_lines" >&2
+            head -n 20 "$f" >&2 || true
+            exit 1
+          fi
+        done
+
+    - name: Merge and IP lists and deep deduplication
+      run: |
+        set -euo pipefail
+        cat dist/ipip_net.txt dist/chunzhen.txt | dist/dedup > dist/CN-ip-cidr.txt
+
+    - name: Generate GeoIP2 database
+      run: |
+        set -euo pipefail
+        CURRENT_DIR=$(pwd)
+        cd dist
+        ./ipip2mmdb -s ./CN-ip-cidr.txt -d Country.mmdb
+        cd $CURRENT_DIR
+
+    - name: Validate artifacts
+      run: |
+        set -euo pipefail
+        test -s dist/CN-ip-cidr.txt
+        test -s dist/Country.mmdb
+
+        cidr_lines=$(grep -cE '^[0-9]{1,3}(\.[0-9]{1,3}){3}/[0-9]{1,2}$' dist/CN-ip-cidr.txt || true)
+        if [[ "$cidr_lines" -lt 3000 ]]; then
+          echo "CN-ip-cidr.txt too small or malformed; CIDR-looking lines: $cidr_lines" >&2
+          head -n 20 dist/CN-ip-cidr.txt >&2 || true
+          exit 1
+        fi
+
+        mmdb_bytes=$(stat -c%s dist/Country.mmdb)
+        if [[ "$mmdb_bytes" -lt 10000 ]]; then
+          echo "Country.mmdb too small: ${mmdb_bytes} bytes" >&2
+          exit 1
+        fi
+
+    - name: Sanity check mmdb
+      run: |
+        set -euo pipefail
+        cd dist
+        ./verify_ip -db Country.mmdb -ip "123.126.55.41,117.23.61.238" -expect CN
+        ./verify_ip -db Country.mmdb -ip "8.8.8.8" -expect "" -allow-miss
+
+    - name: Push artifacts to release branch
+      id: release_artifacts
+      run: |
+        set -euo pipefail
+        git config --local user.email "9620247+github-actions[bot]@users.noreply.github.com"
+        git config --local user.name "github-actions[bot]"
+
+        git fetch origin
+
+        git checkout --orphan release-orphan
+        git rm -rf . || true
+
+        cp -rf dist/CN-ip-cidr.txt ./
+        cp -rf dist/Country.mmdb ./
+
+        git add Country.mmdb CN-ip-cidr.txt
+
+        if git diff --cached --quiet; then
+          echo "No changes in artifacts; skipping release update."
+          echo "changed=false" >> "$GITHUB_OUTPUT"
+          exit 0
+        fi
+
+        git commit -m "Updated at $(date)"
+        echo "changed=true" >> "$GITHUB_OUTPUT"
+
+        git branch -D release || true
+        git branch -m release
+            
+    - name: Push release branch
+      if: steps.release_artifacts.outputs.changed == 'true'
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      run: |
+        set -euo pipefail
+        for attempt in 1 2 3; do
+          if git push origin release --force; then
+            exit 0
+          fi
+          echo "git push failed (attempt $attempt); retrying..." >&2
+          sleep $((attempt * 5))
+        done
+        echo "git push failed after retries" >&2
+        exit 1
+
+    - name: Purge CDN Cache
+      if: steps.release_artifacts.outputs.changed == 'true'
+      env:
+        CDN_URL: ${{ secrets.CDN_URL }}
+      run: |
+        set -euo pipefail
+        if [[ -z "${CDN_URL}" ]]; then
+          echo "CDN_URL secret not set; skipping purge."
+          exit 0
+        fi
+        curl -fSL --retry 3 --retry-delay 5 "${CDN_URL}"
