@@ -124,6 +124,9 @@ func main() {
 			DatabaseType: databaseType,
 			RecordSize:   28,
 			Languages:    []string{"de", "en", "es", "fr", "ja", "pt-BR", "ru", "zh-CN"},
+			Description: map[string]string{
+				"en": "GeoLite2 Country database",
+			},
 		},
 	)
 	if err != nil {
@@ -154,6 +157,7 @@ func main() {
 	if err != nil {
 		log.Fatalf("fail to create output file %v\n", err)
 	}
+	defer outFh.Close()
 
 	_, err = writer.WriteTo(outFh)
 	if err != nil {
